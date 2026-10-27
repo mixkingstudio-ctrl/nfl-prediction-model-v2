@@ -11,7 +11,7 @@ DATA = ROOT / 'data'
 DATA.mkdir(exist_ok=True)
 st.set_page_config(page_title='NFL Weekly Report Dashboard 2.0', layout='wide')
 st.title('🏈 NFL Weekly Report Dashboard 2.0')
-st.caption('Moneyline • Over/Under • Walk-forward validation • Bet tracking')
+st.caption('Moneyline • Over/Under • Spreads • Walk-forward validation • Bet tracking')
 
 
 def read(path):
@@ -59,13 +59,44 @@ with t1:
         else:
             p['favorite'] = p.apply(lambda r: r.home_team if r.home_win_probability >= .5 else r.away_team, axis=1)
             p['favorite_probability'] = p.home_win_probability.where(p.home_win_probability >= .5, 1 - p.home_win_probability)
-            st.subheader('Top three predicted winners')
-            st.dataframe(p.sort_values('favorite_probability', ascending=False)[['gameday', 'away_team', 'home_team', 'favorite', 'favorite_probability', 'pred_away_score', 'pred_home_score']].head(3), hide_index=True, use_container_width=True)
-            st.subheader('Totals: model edge vs market')
+
+            st.subheader('💵 Moneyline predictions')
+            ml = p[['gameday', 'away_team', 'home_team', 'favorite', 'favorite_probability']].copy()
+            ml = ml.sort_values('favorite_probability', ascending=False)
+            ml = ml.rename(columns={'favorite': 'Predicted winner', 'favorite_probability': 'Win probability'})
+            ml['Win probability'] = ml['Win probability'].map(lambda x: f'{x:.1%}')
+            st.dataframe(ml, hide_index=True, use_container_width=True)
+            st.info('Sportsbook moneyline odds are not connected. These are model win probabilities, not quoted betting prices or verified edges.')
+
+            st.subheader('🏆 Top three predicted winners')
+            top = p.sort_values('favorite_probability', ascending=False)[['gameday', 'away_team', 'home_team', 'favorite', 'favorite_probability', 'pred_away_score', 'pred_home_score']].head(3).copy()
+            top['favorite_probability'] = top['favorite_probability'].map(lambda x: f'{x:.1%}')
+            st.dataframe(top, hide_index=True, use_container_width=True)
+
+            st.subheader('📉 Over/Under — model edge vs market')
             cols = ['gameday', 'away_team', 'home_team', 'pred_total', 'total_pick', 'total_edge']
             if 'book_total' in p:
                 cols.insert(4, 'book_total')
-            st.dataframe(p.sort_values('total_edge', key=lambda x: x.abs(), ascending=False)[cols], hide_index=True, use_container_width=True)
+            available_cols = [c for c in cols if c in p.columns]
+            if 'total_edge' in p.columns:
+                totals = p.sort_values('total_edge', key=lambda x: x.abs(), ascending=False)
+            else:
+                totals = p
+            st.dataframe(totals[available_cols], hide_index=True, use_container_width=True)
+            if 'book_total' not in p.columns:
+                st.caption('Sportsbook total lines are unavailable; no verified market edge is implied.')
+
+            st.subheader('📊 Point spreads')
+            if {'pred_home_score', 'pred_away_score'}.issubset(p.columns):
+                spread = p[['gameday', 'away_team', 'home_team', 'pred_away_score', 'pred_home_score']].copy()
+                spread['Predicted home margin'] = spread['pred_home_score'] - spread['pred_away_score']
+                if 'book_home_spread' in p.columns:
+                    spread['Sportsbook home spread'] = p['book_home_spread']
+                st.dataframe(spread, hide_index=True, use_container_width=True)
+                st.caption('Predicted home margin = home score minus away score. Sportsbook spread may not be available.')
+            else:
+                st.info('Predicted score data is not available.')
+
             st.download_button('Download all picks (CSV)', p.to_csv(index=False), 'sunday_picks.csv')
     st.warning('Baseline model only. Verify game dates, calibration and source data. Live sportsbook odds, weather and injuries are not yet connected.')
 
