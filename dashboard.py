@@ -4,8 +4,8 @@ import pandas as pd
 import streamlit as st
 ROOT=Path(__file__).resolve().parent
 ART=ROOT/'artifacts';DATA=ROOT/'data';DATA.mkdir(exist_ok=True)
-st.set_page_config(page_title='NFL Prediction Model 4.0 (Research)',layout='wide')
-st.title('🏈 NFL Prediction Model 4.0 (Research)')
+st.set_page_config(page_title='NFL Prediction Model 5.0 (Research)',layout='wide')
+st.title('🏈 NFL Prediction Model 5.0 (Research)')
 st.caption('Moneyline • Over/Under • Spreads • Walk-forward testing • Bet tracker')
 def read(path):
     try:return pd.read_csv(path)
@@ -36,10 +36,24 @@ with t1:
             ml=['gameday','away_team','home_team','favorite','favorite_probability','home_ml','away_ml','home_ml_probability_edge','away_ml_probability_edge','home_ml_ev_per_dollar','away_ml_ev_per_dollar']
             st.dataframe(p[[c for c in ml if c in p]],hide_index=True,use_container_width=True)
             st.caption('Model win probabilities are NOT sportsbook prices. No live odds are connected. Do not interpret estimates as validated betting edges.')
+            st.subheader('🎯 Top three market opportunities')
+            if {'home_ml_ev_per_dollar','away_ml_ev_per_dollar'}.issubset(p):
+                opportunities=[]
+                for _,g in p.iterrows():
+                    for side in ('home','away'):
+                        ev=g.get(f'{side}_ml_ev_per_dollar')
+                        odd=g.get(f'{side}_ml')
+                        if pd.notna(ev) and pd.notna(odd) and ev>0:
+                            opportunities.append({'gameday':g.gameday,'game':f'{g.away_team} @ {g.home_team}',
+                                'selection':g[f'{side}_team'],'american_odds':odd,'estimated_ev_per_dollar':ev})
+                if opportunities:
+                    st.dataframe(pd.DataFrame(opportunities).sort_values('estimated_ev_per_dollar',ascending=False).head(3),hide_index=True,use_container_width=True)
+                    st.caption('Research estimates only; not validated profitable bets. Check sportsbook prices and timing.')
+                else:st.info('No positive-EV opportunities with supplied sportsbook moneyline odds. Missing odds are never treated as betting edges.')
             st.subheader('🏆 Top three predicted winners')
             st.dataframe(p.sort_values('favorite_probability',ascending=False)[['gameday','away_team','home_team','favorite','favorite_probability','pred_away_score','pred_home_score']].head(3),hide_index=True,use_container_width=True)
             st.subheader('📊 Over/Under')
-            cols=['gameday','away_team','home_team','pred_total','book_total','total_pick','total_edge']
+            cols=['gameday','away_team','home_team','pred_total','book_total','total_pick','total_edge','over_probability_est','under_probability_est']
             st.dataframe(p[[c for c in cols if c in p]],hide_index=True,use_container_width=True)
             st.subheader('📈 Spreads')
             cols=['gameday','away_team','home_team','pred_margin_home','book_home_spread','pred_home_score','pred_away_score']
@@ -56,7 +70,7 @@ with t2:
         st.caption('Walk-forward out-of-sample tests. Accuracy and Brier score do not establish profitable betting.')
         comparison=read(ART/'model_comparison.csv')
         if not comparison.empty:
-            st.subheader('3.0 versus 4.0 — same test seasons')
+            st.subheader('3.0 versus 5.0 — same test seasons')
             st.dataframe(comparison.sort_values(['season','model']),hide_index=True,use_container_width=True)
             st.caption('Winner accuracy: higher is better. Brier, spread MAE and total MAE: lower is better. Compare on the same seasons.')
 with t3:

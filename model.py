@@ -1,4 +1,4 @@
-"""NFL Model 4.0: pregame Elo and rolling form; benchmarked against 3.0 on identical test seasons.
+"""NFL Model 5.0 research: pregame Elo, rolling form, total ensemble and probability calibration; benchmarked against 3.0 on identical test seasons.
 No claims of live injury, weather, or sportsbook data without user-provided pregame CSVs.
 """
 from pathlib import Path
@@ -8,6 +8,7 @@ import pandas as pd
 import joblib
 from sklearn.ensemble import HistGradientBoostingRegressor, HistGradientBoostingClassifier
 from sklearn.linear_model import LogisticRegression, Ridge
+from sklearn.isotonic import IsotonicRegression
 from sklearn.pipeline import make_pipeline
 from sklearn.impute import SimpleImputer
 from sklearn.preprocessing import StandardScaler
@@ -106,9 +107,35 @@ def fit(d,cutoff=None):
     models={
         'winner':make_pipeline(SimpleImputer(),StandardScaler(),LogisticRegression(max_iter=1500,C=.12)),
         'margin':make_pipeline(SimpleImputer(),HistGradientBoostingRegressor(max_iter=140,max_leaf_nodes=7,l2_regularization=30,random_state=21)),
-        'total':make_pipeline(SimpleImputer(),HistGradientBoostingRegressor(max_iter=140,max_leaf_nodes=7,l2_regularization=30,random_state=22))}
-    for name,target in [('winner','home_win'),('margin','margin'),('total','total')]:models[name].fit(x,train[target])
+        'total':make_pipeline(SimpleImputer(),HistGradientBoostingRegressor(max_iter=140,max_leaf_nodes=7,l2_regularization=30,random_state=22)),
+        'total_linear':make_pipeline(SimpleImputer(),StandardScaler(),Ridge(alpha=100.0))}
+    for name,target in [('winner','home_win'),('margin','margin'),('total','total'),('total_linear','total')]:models[name].fit(x,train[target])
+    # Fit a calibrator only on prior-season holdout predictions, never test-season outcomes.
+    # Keep it separate from the final model fit to avoid in-sample calibration leakage.
+    models['calibrator']=None
+    if cutoff is None:
+        calibration_year=int(train.season.max())
+    else:
+        calibration_year=int(cutoff)-1
+    earlier=train[train.season<calibration_year]
+    holdout=train[train.season==calibration_year]
+    if len(earlier)>=350 and len(holdout)>=100:
+        prior=make_pipeline(SimpleImputer(),StandardScaler(),LogisticRegression(max_iter=1500,C=.12))
+        prior.fit(earlier[FEATURES],earlier.home_win)
+        raw=prior.predict_proba(holdout[FEATURES])[:,1]
+        # Sigmoid calibration is less prone to overfit than isotonic on one NFL season.
+        calibrator=LogisticRegression(C=0.05,max_iter=1000)
+        calibrator.fit(raw.reshape(-1,1),holdout.home_win)
+        models['calibrator']=calibrator
     return models
+
+def calibrated_probability(models,x):
+    raw=models['winner'].predict_proba(x)[:,1]
+    cal=models.get('calibrator')
+    return cal.predict_proba(raw.reshape(-1,1))[:,1] if cal is not None else raw
+
+def total_projection(models,x):
+    return 0.65*models['total'].predict(x)+0.35*models['total_linear'].predict(x)
 
 def backtest(d):
     """Evaluate both versions on the exact same completed seasons and games."""
@@ -120,9 +147,9 @@ def backtest(d):
         base_test=base_d[(base_d.season==year)&base_d.margin.notna()&base_d.home_win.notna()]
         if len(test)<50 or len(d[(d.season<year)&d.margin.notna()])<350:continue
         models=fit(d,year);x=test[FEATURES]
-        prob=models['winner'].predict_proba(x)[:,1];margin=models['margin'].predict(x);total=models['total'].predict(x)
+        prob=calibrated_probability(models,x);margin=models['margin'].predict(x);total=total_projection(models,x)
         metrics=dict(season=year,games=len(test),winner_accuracy=accuracy_score(test.home_win,prob>=.5),winner_brier=brier_score_loss(test.home_win,prob),winner_log_loss=log_loss(test.home_win,np.clip(prob,.001,.999)),spread_mae=mean_absolute_error(test.margin,margin),total_mae=mean_absolute_error(test.total,total))
-        rows.append(metrics);compare.append(dict(model='4.0',**metrics))
+        rows.append(metrics);compare.append(dict(model='5.0',**metrics))
         for i,(_,g) in enumerate(test.iterrows()):preds.append(dict(season=year,game_id=g.get('game_id',''),actual_margin=g.margin,actual_total=g.total,actual_home_win=g.home_win,pred_margin=margin[i],pred_total=total[i],home_win_probability=prob[i]))
         if len(base_test)==len(test):
             bm=baseline.fit(base_d,year); bx=base_test[baseline.FEATURES]
@@ -132,7 +159,7 @@ def backtest(d):
     pd.DataFrame(rows,columns=cols).to_csv(ART/'backtest.csv',index=False)
     pd.DataFrame(preds).to_csv(ART/'backtest_predictions.csv',index=False)
     pd.DataFrame(compare,columns=['model']+cols).to_csv(ART/'model_comparison.csv',index=False)
-    print('Compared Model 3.0 and 4.0 on',len(rows),'recent seasons')
+    print('Evaluated Model 5.0 against Model 3.0 on',len(rows),'recent seasons')
 
 def implied(odds):
     if pd.isna(odds) or odds==0:return np.nan
@@ -144,8 +171,8 @@ def predict(d,models):
         print('No upcoming games available in schedule');return
     x=upcoming[FEATURES]
     upcoming['pred_margin_home']=models['margin'].predict(x)
-    upcoming['pred_total']=models['total'].predict(x)
-    upcoming['home_win_probability']=models['winner'].predict_proba(x)[:,1]
+    upcoming['pred_total']=total_projection(models,x)
+    upcoming['home_win_probability']=calibrated_probability(models,x)
     upcoming['pred_home_score']=(upcoming.pred_total+upcoming.pred_margin_home)/2
     upcoming['pred_away_score']=(upcoming.pred_total-upcoming.pred_margin_home)/2
     odds=optional('odds.csv')
@@ -157,6 +184,20 @@ def predict(d,models):
     for field in ['book_total','home_ml','away_ml','book_home_spread']:
         if field not in upcoming:upcoming[field]=np.nan
         upcoming[field]=pd.to_numeric(upcoming[field],errors='coerce')
+    # Residual scale from chronological validation is used only for rough totals estimates.
+    # Do not infer a market edge without an actual supplied book line.
+    from scipy.special import ndtr
+    residual_path=ART/'backtest_predictions.csv'
+    sigma=np.nan
+    if residual_path.exists():
+        try:
+            residuals=pd.read_csv(residual_path)
+            sigma=float((residuals.actual_total-residuals.pred_total).std())
+        except (ValueError,KeyError,TypeError):pass
+    if not np.isfinite(sigma) or sigma<1:sigma=13.5
+    upcoming['over_probability_est']=ndtr((upcoming.pred_total-upcoming.book_total)/sigma)
+    upcoming.loc[upcoming.book_total.isna(),'over_probability_est']=np.nan
+    upcoming['under_probability_est']=1-upcoming.over_probability_est
     upcoming['total_edge']=upcoming.pred_total-upcoming.book_total
     upcoming['total_pick']=np.select([upcoming.total_edge>=3,upcoming.total_edge<=-3],['OVER','UNDER'],default='PASS')
     upcoming.loc[upcoming.book_total.isna(),'total_pick']='NO LINE'
@@ -166,7 +207,7 @@ def predict(d,models):
     upcoming['away_ml_probability_edge']=1-upcoming.home_win_probability-upcoming.away_ml_implied
     upcoming['home_ml_ev_per_dollar']=upcoming.home_win_probability*upcoming.home_ml.map(lambda o: o/100 if pd.notna(o) and o>0 else (100/abs(o) if pd.notna(o) and o<0 else np.nan))-(1-upcoming.home_win_probability)
     upcoming['away_ml_ev_per_dollar']=(1-upcoming.home_win_probability)*upcoming.away_ml.map(lambda o: o/100 if pd.notna(o) and o>0 else (100/abs(o) if pd.notna(o) and o<0 else np.nan))-upcoming.home_win_probability
-    upcoming['model_status']='V4_RESEARCH_UNCALIBRATED_NO_LIVE_ODDS'
+    upcoming['model_status']='V5_RESEARCH_NO_LIVE_ODDS_CALIBRATION_EXPERIMENTAL'
     upcoming.to_csv(ART/'sunday_picks.csv',index=False)
     print('Wrote',len(upcoming),'future game projections')
 
