@@ -1,150 +1,83 @@
 from pathlib import Path
-import subprocess
-import sys
-
+import subprocess,sys
 import pandas as pd
 import streamlit as st
-
-ROOT = Path(__file__).resolve().parent
-ART = ROOT / 'artifacts'
-DATA = ROOT / 'data'
-DATA.mkdir(exist_ok=True)
-st.set_page_config(page_title='NFL Weekly Report Dashboard 2.0', layout='wide')
-st.title('🏈 NFL Weekly Report Dashboard 2.0')
-st.caption('Moneyline • Over/Under • Spreads • Walk-forward validation • Bet tracking')
-
-
+ROOT=Path(__file__).resolve().parent
+ART=ROOT/'artifacts';DATA=ROOT/'data';DATA.mkdir(exist_ok=True)
+st.set_page_config(page_title='NFL Prediction Model 3.0',layout='wide')
+st.title('🏈 NFL Prediction Model 3.0')
+st.caption('Moneyline • Over/Under • Spreads • Walk-forward testing • Bet tracker')
 def read(path):
-    try:
-        return pd.read_csv(path)
-    except (FileNotFoundError, pd.errors.EmptyDataError):
-        return pd.DataFrame()
-
-
-t1, t2, t3 = st.tabs(['Sunday predictions', 'Backtesting', 'Bet tracker'])
+    try:return pd.read_csv(path)
+    except (FileNotFoundError,pd.errors.EmptyDataError):return pd.DataFrame()
+t1,t2,t3=st.tabs(['Sunday picks','Backtesting','Bet tracker'])
 with t1:
-    if st.button('🏈 Run Predictions', type='primary'):
-        with st.spinner('Downloading NFL data, training model, and generating picks. This may take several minutes...'):
+    if st.button('🏈 Run Predictions',type='primary'):
+        with st.spinner('Refreshing schedule, training models and testing historical seasons...'):
             try:
-                result = subprocess.run(
-                    [sys.executable, str(ROOT / 'model.py'), 'all'],
-                    cwd=str(ROOT), capture_output=True, text=True, timeout=600,
-                )
-                if result.returncode == 0:
-                    st.success('Prediction run completed.')
-                    st.rerun()
-                else:
-                    st.error('Prediction generation failed. See details below.')
-                    st.code((result.stderr or result.stdout or 'No error details returned.')[-6000:])
-            except subprocess.TimeoutExpired:
-                st.error('Prediction generation exceeded 10 minutes. Please try again.')
-            except Exception as exc:
-                st.error(f'Unable to generate predictions: {exc}')
-
-    picks = read(ART / 'sunday_picks.csv')
-    if picks.empty:
-        st.info('No picks yet. Click Run Predictions above to train the baseline model and generate picks.')
+                result=subprocess.run([sys.executable,str(ROOT/'model.py'),'all'],cwd=ROOT,capture_output=True,text=True,timeout=600)
+                if result.returncode:st.error('Model run failed');st.code((result.stderr or result.stdout)[-6000:])
+                else:st.success('Predictions generated');st.rerun()
+            except Exception as exc:st.error(f'Model run could not complete: {exc}')
+    picks=read(ART/'sunday_picks.csv')
+    if picks.empty:st.info('No predictions yet. Click Run Predictions. The schedule source must include future games.')
     else:
-        seasons = sorted(picks.season.dropna().unique().tolist())
-        sel = st.selectbox('Season', seasons, index=len(seasons) - 1) if seasons else None
-        p = picks[picks.season == sel] if sel is not None else picks
-        if 'week' in p:
-            weeks = sorted(p.week.dropna().unique().tolist())
-            week = st.selectbox('Week', weeks, index=0) if weeks else None
-            if week is not None:
-                p = p[p.week == week]
-        p = p.copy()
-        if p.empty:
-            st.info('No predictions available for the selected week.')
+        seasons=sorted(picks.season.dropna().unique().tolist())
+        season=st.selectbox('Season',seasons,index=len(seasons)-1) if seasons else None
+        p=picks[picks.season==season].copy() if season is not None else picks.copy()
+        if 'week' in p and len(p):
+            weeks=sorted(p.week.dropna().unique().tolist())
+            if weeks:p=p[p.week==st.selectbox('Week',weeks,index=0)]
+        if p.empty:st.info('No games for this selection.')
         else:
-            p['favorite'] = p.apply(lambda r: r.home_team if r.home_win_probability >= .5 else r.away_team, axis=1)
-            p['favorite_probability'] = p.home_win_probability.where(p.home_win_probability >= .5, 1 - p.home_win_probability)
-
-            st.subheader('💵 Moneyline predictions')
-            ml = p[['gameday', 'away_team', 'home_team', 'favorite', 'favorite_probability']].copy()
-            ml = ml.sort_values('favorite_probability', ascending=False)
-            ml = ml.rename(columns={'favorite': 'Predicted winner', 'favorite_probability': 'Win probability'})
-            ml['Win probability'] = ml['Win probability'].map(lambda x: f'{x:.1%}')
-            st.dataframe(ml, hide_index=True, use_container_width=True)
-            st.info('Sportsbook moneyline odds are not connected. These are model win probabilities, not quoted betting prices or verified edges.')
-
+            p['favorite']=p.apply(lambda r:r.home_team if r.home_win_probability>=.5 else r.away_team,axis=1)
+            p['favorite_probability']=p.home_win_probability.where(p.home_win_probability>=.5,1-p.home_win_probability)
+            st.subheader('💵 Moneyline')
+            ml=['gameday','away_team','home_team','favorite','favorite_probability','home_ml','away_ml','home_ml_probability_edge','away_ml_probability_edge','home_ml_ev_per_dollar','away_ml_ev_per_dollar']
+            st.dataframe(p[[c for c in ml if c in p]],hide_index=True,use_container_width=True)
+            st.caption('Model win probabilities are NOT sportsbook prices. Missing market odds/edge are left blank; probabilities are not yet calibrated.')
             st.subheader('🏆 Top three predicted winners')
-            top = p.sort_values('favorite_probability', ascending=False)[['gameday', 'away_team', 'home_team', 'favorite', 'favorite_probability', 'pred_away_score', 'pred_home_score']].head(3).copy()
-            top['favorite_probability'] = top['favorite_probability'].map(lambda x: f'{x:.1%}')
-            st.dataframe(top, hide_index=True, use_container_width=True)
-
-            st.subheader('📉 Over/Under — model edge vs market')
-            cols = ['gameday', 'away_team', 'home_team', 'pred_total', 'total_pick', 'total_edge']
-            if 'book_total' in p:
-                cols.insert(4, 'book_total')
-            available_cols = [c for c in cols if c in p.columns]
-            if 'total_edge' in p.columns:
-                totals = p.sort_values('total_edge', key=lambda x: x.abs(), ascending=False)
-            else:
-                totals = p
-            st.dataframe(totals[available_cols], hide_index=True, use_container_width=True)
-            if 'book_total' not in p.columns:
-                st.caption('Sportsbook total lines are unavailable; no verified market edge is implied.')
-
-            st.subheader('📊 Point spreads')
-            if {'pred_home_score', 'pred_away_score'}.issubset(p.columns):
-                spread = p[['gameday', 'away_team', 'home_team', 'pred_away_score', 'pred_home_score']].copy()
-                spread['Predicted home margin'] = spread['pred_home_score'] - spread['pred_away_score']
-                if 'book_home_spread' in p.columns:
-                    spread['Sportsbook home spread'] = p['book_home_spread']
-                st.dataframe(spread, hide_index=True, use_container_width=True)
-                st.caption('Predicted home margin = home score minus away score. Sportsbook spread may not be available.')
-            else:
-                st.info('Predicted score data is not available.')
-
-            st.download_button('Download all picks (CSV)', p.to_csv(index=False), 'sunday_picks.csv')
-    st.warning('Baseline model only. Verify game dates, calibration and source data. Live sportsbook odds, weather and injuries are not yet connected.')
-
+            st.dataframe(p.sort_values('favorite_probability',ascending=False)[['gameday','away_team','home_team','favorite','favorite_probability','pred_away_score','pred_home_score']].head(3),hide_index=True,use_container_width=True)
+            st.subheader('📊 Over/Under')
+            cols=['gameday','away_team','home_team','pred_total','book_total','total_pick','total_edge']
+            st.dataframe(p[[c for c in cols if c in p]],hide_index=True,use_container_width=True)
+            st.subheader('📈 Spreads')
+            cols=['gameday','away_team','home_team','pred_margin_home','book_home_spread','pred_home_score','pred_away_score']
+            st.dataframe(p[[c for c in cols if c in p]],hide_index=True,use_container_width=True)
+            st.caption('Predicted home margin = home score minus away score. A negative number favors the away team.')
+            st.download_button('Download all picks CSV',p.to_csv(index=False),'sunday_picks.csv')
+    st.warning('Research baseline, not validated betting advice. EPA, live injuries, weather and sportsbook odds are NOT automatically connected. Optional CSV inputs must be sourced pregame.')
 with t2:
-    bt = read(ART / 'backtest.csv')
-    if bt.empty:
-        st.info('No backtest results yet. Run Predictions from the Sunday predictions tab first.')
+    bt=read(ART/'backtest.csv')
+    if bt.empty:st.info('Run Predictions to generate chronological season-by-season test results.')
     else:
-        st.dataframe(bt, use_container_width=True, hide_index=True)
-        st.line_chart(bt.set_index('season')[['spread_mae', 'total_mae']])
-        st.caption('Chronological season-by-season out-of-sample testing; no random train/test split.')
-
+        st.dataframe(bt,hide_index=True,use_container_width=True)
+        if {'season','spread_mae','total_mae'}.issubset(bt):st.line_chart(bt.set_index('season')[['spread_mae','total_mae']])
+        st.caption('Walk-forward out-of-sample tests. Accuracy and Brier score do not establish profitable betting.')
 with t3:
-    betsfile = DATA / 'bets.csv'
-    bets = read(betsfile)
+    path=DATA/'bets.csv';bets=read(path)
     with st.form('bet'):
-        a, b, c = st.columns(3)
-        with a:
-            game = st.text_input('Game')
-            selection = st.text_input('Selection (e.g. UNDER 44.5)')
-        with b:
-            odds = st.number_input('American odds', value=-110, step=5)
-            stake = st.number_input('Stake ($)', min_value=0., value=20., step=5.)
-        with c:
-            result = st.selectbox('Result', ['PENDING', 'WIN', 'LOSS', 'PUSH'])
-            date = st.date_input('Date')
-        save = st.form_submit_button('Add bet')
+        a,b,c=st.columns(3)
+        with a:game=st.text_input('Game');selection=st.text_input('Selection')
+        with b:odds=st.number_input('American odds',value=-110,step=5);stake=st.number_input('Stake ($)',min_value=0.,value=20.,step=5.)
+        with c:result=st.selectbox('Result',['PENDING','WIN','LOSS','PUSH']);date=st.date_input('Date')
+        save=st.form_submit_button('Add bet')
     if save:
-        if not game or not selection:
-            st.error('Enter game and selection.')
+        if not game or not selection:st.error('Enter game and selection.')
         else:
-            entry = pd.DataFrame([{'date': str(date), 'game': game, 'selection': selection, 'american_odds': odds, 'stake': stake, 'result': result}])
-            bets = pd.concat([bets, entry], ignore_index=True)
-            bets.to_csv(betsfile, index=False)
-            st.success('Bet recorded in this app instance. Export regularly: Streamlit cloud storage is not permanent.')
+            entry=pd.DataFrame([dict(date=str(date),game=game,selection=selection,american_odds=odds,stake=stake,result=result)])
+            bets=pd.concat([bets,entry],ignore_index=True);bets.to_csv(path,index=False)
+            st.success('Bet saved temporarily. Download the log regularly: Streamlit cloud storage is ephemeral.')
     if not bets.empty:
         def profit(r):
-            if r.result == 'WIN':
-                return r.stake * (r.american_odds / 100 if r.american_odds > 0 else 100 / abs(r.american_odds))
-            if r.result == 'LOSS':
-                return -r.stake
+            if r.result=='WIN':return r.stake*(r.american_odds/100 if r.american_odds>0 else 100/abs(r.american_odds))
+            if r.result=='LOSS':return -r.stake
             return 0.
-        bets['profit'] = bets.apply(profit, axis=1)
-        settled = bets[bets.result.isin(['WIN', 'LOSS', 'PUSH'])]
-        risk = settled.stake.sum()
-        x, y, z = st.columns(3)
-        x.metric('Net profit', f"${settled.profit.sum():.2f}")
-        y.metric('ROI', f"{100 * settled.profit.sum() / risk:.1f}%" if risk else 'N/A')
-        z.metric('Settled bets', len(settled))
-        st.dataframe(bets, use_container_width=True, hide_index=True)
-        st.download_button('Export bet log', bets.to_csv(index=False), 'bet_log.csv')
+        bets['profit']=bets.apply(profit,axis=1)
+        settled=bets[bets.result.isin(['WIN','LOSS','PUSH'])];risk=settled.stake.sum()
+        x,y,z=st.columns(3)
+        x.metric('Net profit',f'${settled.profit.sum():.2f}')
+        y.metric('ROI',f'{100*settled.profit.sum()/risk:.1f}%' if risk else 'N/A')
+        z.metric('Settled bets',len(settled))
+        st.dataframe(bets,hide_index=True,use_container_width=True)
+        st.download_button('Export bet log',bets.to_csv(index=False),'bet_log.csv')
