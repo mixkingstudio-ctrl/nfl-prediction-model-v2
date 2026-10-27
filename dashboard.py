@@ -4,8 +4,8 @@ import pandas as pd
 import streamlit as st
 ROOT=Path(__file__).resolve().parent
 ART=ROOT/'artifacts';DATA=ROOT/'data';DATA.mkdir(exist_ok=True)
-st.set_page_config(page_title='NFL Prediction Model 3.0',layout='wide')
-st.title('🏈 NFL Prediction Model 3.0')
+st.set_page_config(page_title='NFL Prediction Model 4.0 (Research)',layout='wide')
+st.title('🏈 NFL Prediction Model 4.0 (Research)')
 st.caption('Moneyline • Over/Under • Spreads • Walk-forward testing • Bet tracker')
 def read(path):
     try:return pd.read_csv(path)
@@ -15,7 +15,7 @@ with t1:
     if st.button('🏈 Run Predictions',type='primary'):
         with st.spinner('Refreshing schedule, training models and testing historical seasons...'):
             try:
-                result=subprocess.run([sys.executable,str(ROOT/'model.py'),'all'],cwd=ROOT,capture_output=True,text=True,timeout=600)
+                result=subprocess.run([sys.executable,str(ROOT/'model.py'),'all'],cwd=ROOT,capture_output=True,text=True,timeout=900)
                 if result.returncode:st.error('Model run failed');st.code((result.stderr or result.stdout)[-6000:])
                 else:st.success('Predictions generated');st.rerun()
             except Exception as exc:st.error(f'Model run could not complete: {exc}')
@@ -35,7 +35,7 @@ with t1:
             st.subheader('💵 Moneyline')
             ml=['gameday','away_team','home_team','favorite','favorite_probability','home_ml','away_ml','home_ml_probability_edge','away_ml_probability_edge','home_ml_ev_per_dollar','away_ml_ev_per_dollar']
             st.dataframe(p[[c for c in ml if c in p]],hide_index=True,use_container_width=True)
-            st.caption('Model win probabilities are NOT sportsbook prices. Missing market odds/edge are left blank; probabilities are not yet calibrated.')
+            st.caption('Model win probabilities are NOT sportsbook prices. No live odds are connected. Do not interpret estimates as validated betting edges.')
             st.subheader('🏆 Top three predicted winners')
             st.dataframe(p.sort_values('favorite_probability',ascending=False)[['gameday','away_team','home_team','favorite','favorite_probability','pred_away_score','pred_home_score']].head(3),hide_index=True,use_container_width=True)
             st.subheader('📊 Over/Under')
@@ -52,8 +52,13 @@ with t2:
     if bt.empty:st.info('Run Predictions to generate chronological season-by-season test results.')
     else:
         st.dataframe(bt,hide_index=True,use_container_width=True)
-        if {'season','spread_mae','total_mae'}.issubset(bt):st.line_chart(bt.set_index('season')[['spread_mae','total_mae']])
+        if {'season','spread_mae','total_mae'}.issubset(bt):st.line_chart(bt.set_index(bt['season'].astype(str))[['spread_mae','total_mae']])
         st.caption('Walk-forward out-of-sample tests. Accuracy and Brier score do not establish profitable betting.')
+        comparison=read(ART/'model_comparison.csv')
+        if not comparison.empty:
+            st.subheader('3.0 versus 4.0 — same test seasons')
+            st.dataframe(comparison.sort_values(['season','model']),hide_index=True,use_container_width=True)
+            st.caption('Winner accuracy: higher is better. Brier, spread MAE and total MAE: lower is better. Compare on the same seasons.')
 with t3:
     path=DATA/'bets.csv';bets=read(path)
     with st.form('bet'):

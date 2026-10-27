@@ -1,4 +1,4 @@
-"""NFL Model 3.0: pregame-only features, independent targets, season walk-forward evaluation.
+"""NFL Model 4.0: pregame Elo and rolling form; benchmarked against 3.0 on identical test seasons.
 No claims of live injury, weather, or sportsbook data without user-provided pregame CSVs.
 """
 from pathlib import Path
@@ -6,18 +6,19 @@ import argparse
 import numpy as np
 import pandas as pd
 import joblib
-from sklearn.ensemble import HistGradientBoostingRegressor
+from sklearn.ensemble import HistGradientBoostingRegressor, HistGradientBoostingClassifier
 from sklearn.linear_model import LogisticRegression, Ridge
 from sklearn.pipeline import make_pipeline
 from sklearn.impute import SimpleImputer
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import brier_score_loss, log_loss, mean_absolute_error, accuracy_score
+import model3_baseline as baseline
 
 ROOT=Path(__file__).resolve().parent
 DATA=ROOT/'data'; ART=ROOT/'artifacts'
 DATA.mkdir(exist_ok=True);ART.mkdir(exist_ok=True)
 URL='https://raw.githubusercontent.com/nflverse/nfldata/master/data/games.csv'
-FEATURES=['home_winrate_5','away_winrate_5','home_pf_5','away_pf_5','home_pa_5','away_pa_5','home_margin_5','away_margin_5','home_total_5','away_total_5','home_rest','away_rest','home_games','away_games','neutral_site','wind_mph','temp_f','precip_mm','home_injury_points','away_injury_points']
+FEATURES=['home_winrate_5','away_winrate_5','home_pf_5','away_pf_5','home_pa_5','away_pa_5','home_margin_5','away_margin_5','home_total_5','away_total_5','home_rest','away_rest','home_games','away_games','neutral_site','wind_mph','temp_f','precip_mm','home_injury_points','away_injury_points', 'elo_home_diff', 'home_elo', 'away_elo', 'home_margin_10', 'away_margin_10', 'home_pf_10', 'away_pf_10', 'home_pa_10', 'away_pa_10', 'home_winrate_10', 'away_winrate_10', 'elo_home_prob']
 
 def download():
     d=pd.read_csv(URL,low_memory=False)
@@ -43,18 +44,32 @@ def build_features(games):
     weather=optional('weather.csv');injuries=optional('injuries.csv')
     for frame in (weather,injuries):
         if not frame.empty and 'game_id' in frame:frame['game_id']=frame.game_id.astype(str)
-    history={};rows=[]
+    history={};rows=[]; ratings={}; last_season={}
+    # Elo is updated only after completed games; preseason ratings regress toward 1500.
     # Process an entire date before updating histories: same-day results cannot leak.
     for date,day in games.groupby('gameday',sort=True):
         updates=[]
         for _,g in day.iterrows():
             row=g.to_dict();season=int(g.season) if pd.notna(g.season) else -1
             for side in ('home','away'):
+                team=g[f'{side}_team']
+                if team not in ratings:ratings[team]=1500.
+                if last_season.get(team)!=season:
+                    ratings[team]=1500.+0.65*(ratings[team]-1500.)
+                    last_season[team]=season
+                row[f'{side}_elo']=ratings[team]
+            home_adv=0 if str(g.get('location','Home')).lower()=='neutral' else 45
+            row['elo_home_diff']=row['home_elo']+home_adv-row['away_elo']
+            row['elo_home_prob']=1/(1+10**(-row['elo_home_diff']/400))
+            for side in ('home','away'):
                 team=g[f'{side}_team'];past=history.get(team,[])
                 same=[x for x in past if x['season']==season]
                 recent=same[-5:] or [x for x in past if x['season']==season-1][-5:]
                 for key in ('winrate','pf','pa','margin','total'):
                     row[f'{side}_{key}_5']=float(np.mean([x[key] for x in recent])) if recent else np.nan
+                for key in ('margin','pf','pa','winrate'):
+                    last10=same[-10:] or [x for x in past if x['season']==season-1][-10:]
+                    row[f'{side}_{key}_10']=float(np.mean([x[key] for x in last10])) if last10 else np.nan
                 row[f'{side}_games']=len(same)
                 row[f'{side}_rest']=(date-past[-1]['date']).days if past else np.nan
             row['neutral_site']=int(str(g.get('location','Home')).lower()=='neutral')
@@ -67,34 +82,57 @@ def build_features(games):
             row['home_win']=float(hs>aw) if pd.notna(hs) and pd.notna(aw) and hs!=aw else np.nan
             rows.append(row)
             if pd.notna(hs) and pd.notna(aw):
+                # Store rating updates; no game on the same date sees another result.
+                expected=row['elo_home_prob']
+                actual=1. if hs>aw else (0. if hs<aw else .5)
+                delta=22*(actual-expected)
+                updates.append(('__elo__',g.home_team,g.away_team,delta))
                 updates.extend([(g.home_team,dict(date=date,season=season,winrate=float(hs>aw),pf=hs,pa=aw,margin=hs-aw,total=hs+aw)),(g.away_team,dict(date=date,season=season,winrate=float(aw>hs),pf=aw,pa=hs,margin=aw-hs,total=hs+aw))])
-        for team,entry in updates:history.setdefault(team,[]).append(entry)
+        for item in updates:
+            if len(item)==4 and item[0]=='__elo__':
+                _,h,a,delta=item;ratings[h]+=delta;ratings[a]-=delta
+            else:
+                team,entry=item;history.setdefault(team,[]).append(entry)
     return pd.DataFrame(rows)
 
 def fit(d,cutoff=None):
     train=d.dropna(subset=['margin','total','home_win']).copy()
     if cutoff is not None:train=train[train.season<cutoff]
+    # Recent-season emphasis helps reduce drift from older NFL eras.
+    max_year=int(train.season.max())
+    train=train[train.season>=max_year-7].copy()
     if len(train)<350:raise ValueError('Need at least 350 historical completed games')
     x=train[FEATURES]
     models={
-        'winner':make_pipeline(SimpleImputer(add_indicator=False),StandardScaler(),LogisticRegression(max_iter=1500,C=.25)),
-        'margin':make_pipeline(SimpleImputer(),HistGradientBoostingRegressor(max_iter=120,max_leaf_nodes=8,l2_regularization=20,random_state=21)),
-        'total':make_pipeline(SimpleImputer(),HistGradientBoostingRegressor(max_iter=120,max_leaf_nodes=8,l2_regularization=20,random_state=22))}
+        'winner':make_pipeline(SimpleImputer(),StandardScaler(),LogisticRegression(max_iter=1500,C=.12)),
+        'margin':make_pipeline(SimpleImputer(),HistGradientBoostingRegressor(max_iter=140,max_leaf_nodes=7,l2_regularization=30,random_state=21)),
+        'total':make_pipeline(SimpleImputer(),HistGradientBoostingRegressor(max_iter=140,max_leaf_nodes=7,l2_regularization=30,random_state=22))}
     for name,target in [('winner','home_win'),('margin','margin'),('total','total')]:models[name].fit(x,train[target])
     return models
 
 def backtest(d):
-    rows=[];preds=[]
-    for year in sorted(d.season.dropna().unique()):
+    """Evaluate both versions on the exact same completed seasons and games."""
+    rows=[];preds=[];compare=[]
+    years=[int(y) for y in sorted(d.season.dropna().unique()) if int(y)>=2022]
+    base_d=baseline.build_features(baseline.load())
+    for year in years:
         test=d[(d.season==year)&d.margin.notna()&d.home_win.notna()]
+        base_test=base_d[(base_d.season==year)&base_d.margin.notna()&base_d.home_win.notna()]
         if len(test)<50 or len(d[(d.season<year)&d.margin.notna()])<350:continue
         models=fit(d,year);x=test[FEATURES]
         prob=models['winner'].predict_proba(x)[:,1];margin=models['margin'].predict(x);total=models['total'].predict(x)
-        rows.append(dict(season=int(year),games=len(test),winner_accuracy=accuracy_score(test.home_win,prob>=.5),winner_brier=brier_score_loss(test.home_win,prob),winner_log_loss=log_loss(test.home_win,np.clip(prob,.001,.999)),spread_mae=mean_absolute_error(test.margin,margin),total_mae=mean_absolute_error(test.total,total)))
-        for i,(_,g) in enumerate(test.iterrows()):preds.append(dict(season=int(year),game_id=g.get('game_id',''),actual_margin=g.margin,actual_total=g.total,actual_home_win=g.home_win,pred_margin=margin[i],pred_total=total[i],home_win_probability=prob[i]))
-    pd.DataFrame(rows,columns=['season','games','winner_accuracy','winner_brier','winner_log_loss','spread_mae','total_mae']).to_csv(ART/'backtest.csv',index=False)
+        metrics=dict(season=year,games=len(test),winner_accuracy=accuracy_score(test.home_win,prob>=.5),winner_brier=brier_score_loss(test.home_win,prob),winner_log_loss=log_loss(test.home_win,np.clip(prob,.001,.999)),spread_mae=mean_absolute_error(test.margin,margin),total_mae=mean_absolute_error(test.total,total))
+        rows.append(metrics);compare.append(dict(model='4.0',**metrics))
+        for i,(_,g) in enumerate(test.iterrows()):preds.append(dict(season=year,game_id=g.get('game_id',''),actual_margin=g.margin,actual_total=g.total,actual_home_win=g.home_win,pred_margin=margin[i],pred_total=total[i],home_win_probability=prob[i]))
+        if len(base_test)==len(test):
+            bm=baseline.fit(base_d,year); bx=base_test[baseline.FEATURES]
+            bp=bm['winner'].predict_proba(bx)[:,1];bmargin=bm['margin'].predict(bx);btotal=bm['total'].predict(bx)
+            compare.append(dict(model='3.0',season=year,games=len(base_test),winner_accuracy=accuracy_score(base_test.home_win,bp>=.5),winner_brier=brier_score_loss(base_test.home_win,bp),winner_log_loss=log_loss(base_test.home_win,np.clip(bp,.001,.999)),spread_mae=mean_absolute_error(base_test.margin,bmargin),total_mae=mean_absolute_error(base_test.total,btotal)))
+    cols=['season','games','winner_accuracy','winner_brier','winner_log_loss','spread_mae','total_mae']
+    pd.DataFrame(rows,columns=cols).to_csv(ART/'backtest.csv',index=False)
     pd.DataFrame(preds).to_csv(ART/'backtest_predictions.csv',index=False)
-    print('Walk-forward tested seasons:',len(rows))
+    pd.DataFrame(compare,columns=['model']+cols).to_csv(ART/'model_comparison.csv',index=False)
+    print('Compared Model 3.0 and 4.0 on',len(rows),'recent seasons')
 
 def implied(odds):
     if pd.isna(odds) or odds==0:return np.nan
@@ -128,7 +166,7 @@ def predict(d,models):
     upcoming['away_ml_probability_edge']=1-upcoming.home_win_probability-upcoming.away_ml_implied
     upcoming['home_ml_ev_per_dollar']=upcoming.home_win_probability*upcoming.home_ml.map(lambda o: o/100 if pd.notna(o) and o>0 else (100/abs(o) if pd.notna(o) and o<0 else np.nan))-(1-upcoming.home_win_probability)
     upcoming['away_ml_ev_per_dollar']=(1-upcoming.home_win_probability)*upcoming.away_ml.map(lambda o: o/100 if pd.notna(o) and o>0 else (100/abs(o) if pd.notna(o) and o<0 else np.nan))-upcoming.home_win_probability
-    upcoming['model_status']='BASELINE_UNCALIBRATED_NOT_LIVE_VERIFIED'
+    upcoming['model_status']='V4_RESEARCH_UNCALIBRATED_NO_LIVE_ODDS'
     upcoming.to_csv(ART/'sunday_picks.csv',index=False)
     print('Wrote',len(upcoming),'future game projections')
 
