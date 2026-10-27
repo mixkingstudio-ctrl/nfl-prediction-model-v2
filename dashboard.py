@@ -4,8 +4,8 @@ import pandas as pd
 import streamlit as st
 ROOT=Path(__file__).resolve().parent
 ART=ROOT/'artifacts';DATA=ROOT/'data';DATA.mkdir(exist_ok=True)
-st.set_page_config(page_title='NFL Prediction Model 5.0 (Research)',layout='wide')
-st.title('🏈 NFL Prediction Model 5.0 (Research)')
+st.set_page_config(page_title='NFL Prediction Model 5.1 (Research)',layout='wide')
+st.title('🏈 NFL Prediction Model 5.1 (Research)')
 st.caption('Moneyline • Over/Under • Spreads • Walk-forward testing • Bet tracker')
 def read(path):
     try:return pd.read_csv(path)
@@ -35,7 +35,7 @@ with t1:
             st.subheader('💵 Moneyline')
             ml=['gameday','away_team','home_team','favorite','favorite_probability','home_ml','away_ml','home_ml_probability_edge','away_ml_probability_edge','home_ml_ev_per_dollar','away_ml_ev_per_dollar']
             st.dataframe(p[[c for c in ml if c in p]],hide_index=True,use_container_width=True)
-            st.caption('Model win probabilities are NOT sportsbook prices. No live odds are connected. Do not interpret estimates as validated betting edges.')
+            st.caption('Model 4.0 winner engine restored. Probabilities remain uncalibrated. No live sportsbook odds are connected.')
             st.subheader('🎯 Top three market opportunities')
             if {'home_ml_ev_per_dollar','away_ml_ev_per_dollar'}.issubset(p):
                 opportunities=[]
@@ -60,7 +60,7 @@ with t1:
             st.dataframe(p[[c for c in cols if c in p]],hide_index=True,use_container_width=True)
             st.caption('Predicted home margin = home score minus away score. A negative number favors the away team.')
             st.download_button('Download all picks CSV',p.to_csv(index=False),'sunday_picks.csv')
-    st.warning('Research baseline, not validated betting advice. EPA, live injuries, weather and sportsbook odds are NOT automatically connected. Optional CSV inputs must be sourced pregame.')
+    st.warning('Research release: Moneyline restored from 4.0; totals ensemble is experimental. Not validated betting advice. EPA, live injuries, weather and sportsbook odds are NOT automatically connected. Optional CSV inputs must be sourced pregame.')
 with t2:
     bt=read(ART/'backtest.csv')
     if bt.empty:st.info('Run Predictions to generate chronological season-by-season test results.')
@@ -70,7 +70,7 @@ with t2:
         st.caption('Walk-forward out-of-sample tests. Accuracy and Brier score do not establish profitable betting.')
         comparison=read(ART/'model_comparison.csv')
         if not comparison.empty:
-            st.subheader('3.0 versus 5.0 — same test seasons')
+            st.subheader('4.0 versus 5.1 — same test seasons')
             st.dataframe(comparison.sort_values(['season','model']),hide_index=True,use_container_width=True)
             st.caption('Winner accuracy: higher is better. Brier, spread MAE and total MAE: lower is better. Compare on the same seasons.')
 with t3:
